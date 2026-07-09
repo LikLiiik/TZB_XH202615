@@ -1,0 +1,21 @@
+# 模型文件 (太大)
+Qwen3-ASR-1.7B/
+models/
+
+# 临时文件
+tmp/
+__pycache__/
+*.pyc
+
+# 结果文件 (可重新生成)
+*_result.jsonl
+
+# 数据集
+datasetA/
+
+# 计划文件
+.claude/
+
+# Python
+*.egg-info/
+.venv/
