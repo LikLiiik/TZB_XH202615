@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Speaker Diarization + 唤醒人匹配 ASR
+Speaker Diarization + 唤醒人匹配 ASR（适用所有长度音频）
 
 Pipeline:
   1. Diarization (damo/speech_campplus_speaker-diarization_common)
@@ -9,15 +9,11 @@ Pipeline:
   3. 只拼接目标说话人的片段
   4. Qwen3-ASR 转录 + CER 评估
 
-对于 <5s 的短音频，diarization 模型不适用，回退到整段声纹验证。
+注意: 通过 monkey-patch 绕过了原始模型的 5s 最低时长限制，
+      使 diarization 适用于所有长度的指令音频。
 
 依赖:
   pip install modelscope funasr hdbscan addict simplejson sortedcontainers datasets
-
-模型:
-  - damo/speech_campplus_speaker-diarization_common  (说话人日志)
-  - iic/speech_campplus_sv_zh-cn_16k-common           (声纹提取)
-  - Qwen3-ASR-1.7B                                     (语音识别)
 """
 
 import argparse
@@ -34,9 +30,25 @@ import numpy as np
 import soundfile as sf
 import torch
 from funasr import AutoModel
+from qwen_asr import Qwen3ASRModel
+
+# Monkey-patch: 绕过 ModelScope diarization 的 5s 最低时长限制
+from modelscope.pipelines.audio.segmentation_clustering_pipeline import SegmentationClusteringPipeline
+
+_original_check = SegmentationClusteringPipeline.check_audio_list
+
+def _patched_check(self, audio):
+    audio_dur = 0
+    for i in range(len(audio)):
+        seg = audio[i]
+        assert seg[1] >= seg[0], 'Wrong time stamps.'
+        audio_dur += seg[1] - seg[0]
+    assert audio_dur > 0.3, f'Audio too short: {audio_dur:.1f}s (need > 0.3s)'
+
+SegmentationClusteringPipeline.check_audio_list = _patched_check
+
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
-from qwen_asr import Qwen3ASRModel
 
 # ---- Config ----
 BASE_DIR = Path(__file__).parent
@@ -45,7 +57,6 @@ MODEL_DIR = Path("E:/qwen-asr/Qwen3-ASR-1.7B")
 POS_JSONL = DATASET_DIR / "pos.jsonl"
 
 SPK_THRESHOLD = 0.25
-DIARIZATION_MIN_DUR = 5.0  # diarization 模型要求 > 5s
 
 PUNCT = re.compile(r'[，。！？、；：""''（）《》【】…—·,\.!\?;:\"\'\(\)\[\]{}<>\s]')
 
@@ -93,12 +104,12 @@ def load_models():
     print("  加载模型")
     print("=" * 55)
 
-    print("[1/3] 加载 Speaker Diarization 模型...")
+    print("[1/3] 加载 Speaker Diarization 模型 (已 patch 5s 限制)...")
     sd = pipeline(
         Tasks.speaker_diarization,
         model="damo/speech_campplus_speaker-diarization_common",
     )
-    print("      Diarization 加载完成")
+    print("      Diarization 加载完成 (适用 >= 0.3s 音频)")
 
     print("[2/3] 加载 CAMPPlus 声纹模型...")
     spk_model = AutoModel(
@@ -121,78 +132,75 @@ def load_models():
     return sd, spk_model, asr_model
 
 
-def process_with_diarization(sd, spk_model, asr_model, cmd_audio, sr, kws_audio, kws_sr, ref, threshold):
+def process_sample(sd, spk_model, asr_model, sample, threshold):
     """
-    用 Diarization 分割说话人，匹配唤醒人，只转录目标说话人。
-    返回 (hyp, cer, diarization_segments, target_speaker_id)
+    处理单个样本：Diarization → 说话人匹配 → 提取目标说话人 → ASR
     """
-    # 1. Diarization — 需要临时文件
-    tmp_cmd = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    sf.write(tmp_cmd.name, cmd_audio, sr)
-    tmp_cmd.close()
-    diar_result = sd(tmp_cmd.name)
-    os.unlink(tmp_cmd.name)
+    sid = sample["id"]
+    ref = sample["识别文本"]
+    kws_path = str(DATASET_DIR / sample["唤醒音频"])
+    cmd_path = str(DATASET_DIR / sample["识别音频"])
 
+    kws_audio, sr_k = sf.read(kws_path)
+    cmd_audio, sr_c = sf.read(cmd_path)
+    duration = len(cmd_audio) / sr_c
+
+    # 1. Diarization
+    diar_result = sd(cmd_path)
     segments = diar_result["text"]  # [[start, end, speaker_id], ...]
+
+    if not segments:
+        return {
+            "id": sid, "ref": ref, "hyp": "[NO_SEGMENTS]", "cer": 1.0,
+            "duration": duration, "num_speakers": 0, "target_spk": -1,
+        }
 
     # 2. Group by speaker
     spk_segments = defaultdict(list)
     for start, end, spk_id in segments:
         spk_id = int(spk_id)
-        s_start = int(start * sr)
-        s_end = min(int(end * sr), len(cmd_audio))
+        s_start = int(start * sr_c)
+        s_end = min(int(end * sr_c), len(cmd_audio))
         spk_segments[spk_id].append((start, end, s_start, s_end))
 
-    if not spk_segments:
-        return "[NO_SEGMENTS]", 1.0, segments, -1
-
-    # 3. Match each speaker to kws
-    kws_emb = get_embedding(spk_model, kws_audio, kws_sr)
+    # 3. Match each speaker to kws embedding
+    kws_emb = get_embedding(spk_model, kws_audio, sr_k)
     best_spk = -1
     best_sim = -1
 
     for spk_id in spk_segments:
         parts = [cmd_audio[s:e] for _, _, s, e in spk_segments[spk_id]]
         spk_audio = np.concatenate(parts)
-        spk_emb = get_embedding(spk_model, spk_audio, sr)
+        spk_emb = get_embedding(spk_model, spk_audio, sr_c)
         sim = cosine(kws_emb, spk_emb)
         if sim > best_sim:
             best_sim = sim
             best_spk = spk_id
 
-    # 4. Extract target speaker's audio
+    # 4. Extract target speaker audio + ASR
     if best_spk >= 0 and best_sim >= threshold:
         parts = [cmd_audio[s:e] for _, _, s, e in spk_segments[best_spk]]
         target_audio = np.concatenate(parts)
-
-        # 5. ASR
-        r = asr_model.transcribe(audio=(target_audio, sr), language="Chinese")
+        r = asr_model.transcribe(audio=(target_audio, sr_c), language="Chinese")
         hyp = r[0].text.strip()
         cer = compute_cer(ref, hyp)
-        return hyp, cer, segments, best_spk
+        return {
+            "id": sid, "ref": ref, "hyp": hyp, "cer": cer,
+            "duration": duration, "num_speakers": len(spk_segments),
+            "target_spk": best_spk, "target_sim": best_sim,
+            "spk_pass": True,
+        }
     else:
-        return "[NO_TARGET_SPEAKER]", 1.0, segments, best_spk
-
-
-def process_whole_file(spk_model, asr_model, cmd_audio, sr, kws_audio, kws_sr, ref, threshold):
-    """
-    短音频回退方案：整段声纹验证。
-    """
-    kws_emb = get_embedding(spk_model, kws_audio, kws_sr)
-    cmd_emb = get_embedding(spk_model, cmd_audio, sr)
-    sim = cosine(kws_emb, cmd_emb)
-
-    if sim >= threshold:
-        r = asr_model.transcribe(audio=(cmd_audio, sr), language="Chinese")
-        hyp = r[0].text.strip()
-        cer = compute_cer(ref, hyp)
-        return hyp, cer, sim, True
-    else:
-        return "[NON_TARGET_SPEAKER]", 1.0, sim, False
+        return {
+            "id": sid, "ref": ref, "hyp": "[NO_TARGET_SPEAKER]", "cer": 1.0,
+            "duration": duration, "num_speakers": len(spk_segments),
+            "target_spk": best_spk, "target_sim": best_sim,
+            "spk_pass": False,
+        }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Speaker Diarization + 唤醒人匹配 ASR")
+    parser = argparse.ArgumentParser(description="Speaker Diarization + 唤醒人匹配 ASR (全长度)")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=SPK_THRESHOLD)
     args = parser.parse_args()
@@ -209,113 +217,74 @@ def main():
 
     print("=" * 55)
     print(f"  Diarization + 唤醒人匹配 ASR ({len(samples)} 样本)")
+    print(f"  声纹阈值: {threshold}")
     print("=" * 55)
 
     results = []
-    stats = {"diarization": 0, "whole_file": 0, "too_short": 0,
-             "target_found": 0, "target_not_found": 0}
     t0 = time.time()
 
     for idx, s in enumerate(samples):
-        sid = s["id"]
-        ref = s["识别文本"]
-        kws_path = str(DATASET_DIR / s["唤醒音频"])
-        cmd_path = str(DATASET_DIR / s["识别音频"])
-
         try:
-            kws_audio, sr_k = sf.read(kws_path)
-            cmd_audio, sr_c = sf.read(cmd_path)
-            duration = len(cmd_audio) / sr_c
-
-            if duration >= DIARIZATION_MIN_DUR:
-                # Diarization pipeline
-                stats["diarization"] += 1
-                hyp, cer, segments, target_spk = process_with_diarization(
-                    sd, spk_model, asr_model,
-                    cmd_audio, sr_c, kws_audio, sr_k, ref, threshold
-                )
-                results.append({
-                    "id": sid, "ref": ref, "hyp": hyp, "cer": cer,
-                    "method": "diarization",
-                    "duration": duration,
-                    "diar_segments": len(segments) if isinstance(segments, list) else 0,
-                    "target_spk": target_spk,
-                })
-                if hyp not in ("[NO_SEGMENTS]", "[NO_TARGET_SPEAKER]"):
-                    stats["target_found"] += 1
-                else:
-                    stats["target_not_found"] += 1
-            else:
-                # Short audio — whole-file fallback
-                stats["whole_file"] += 1
-                stats["too_short"] += 1
-                hyp, cer, sim, matched = process_whole_file(
-                    spk_model, asr_model,
-                    cmd_audio, sr_c, kws_audio, sr_k, ref, threshold
-                )
-                results.append({
-                    "id": sid, "ref": ref, "hyp": hyp, "cer": cer,
-                    "method": "whole_file",
-                    "duration": duration,
-                    "spk_sim": sim,
-                    "spk_pass": matched,
-                })
-                if matched:
-                    stats["target_found"] += 1
-                else:
-                    stats["target_not_found"] += 1
+            r = process_sample(sd, spk_model, asr_model, s, threshold)
+            results.append(r)
         except Exception as e:
             results.append({
-                "id": sid, "ref": ref, "hyp": "[ERROR]",
-                "cer": 1.0, "method": "error",
-                "duration": 0,
+                "id": s["id"], "ref": s["识别文本"], "hyp": "[ERROR]",
+                "cer": 1.0, "duration": 0, "num_speakers": 0, "target_spk": -1,
             })
 
         if (idx + 1) % 20 == 0 or (idx + 1) == len(samples):
             elapsed = time.time() - t0
             speed = (idx + 1) / elapsed if elapsed > 0 else 0
             eta = (len(samples) - idx - 1) / speed if speed > 0 else 0
+            pass_cnt = sum(1 for r in results if r.get("spk_pass"))
+            reject_cnt = sum(1 for r in results if not r.get("spk_pass"))
+            multi_spk = sum(1 for r in results if r.get("num_speakers", 0) > 1)
             print(f"  {idx + 1}/{len(samples)} | "
-                  f"diarization:{stats['diarization']} whole:{stats['whole_file']} | "
-                  f"target:{stats['target_found']} other:{stats['target_not_found']} | "
+                  f"通过:{pass_cnt} 拒绝:{reject_cnt} | "
+                  f"多人:{multi_spk} | "
                   f"{speed:.1f}/s | ETA {eta / 60:.1f}min")
 
     # === Evaluation ===
     print(f"\n{'=' * 55}")
     print(f"  评估报告")
     print(f"{'=' * 55}")
-    print(f"  总样本:             {len(results)}")
-    print(f"  使用 Diarization:   {stats['diarization']}")
-    print(f"  使用整段声纹:       {stats['whole_file']} (< {DIARIZATION_MIN_DUR}s)")
-    print(f"  找到目标说话人:     {stats['target_found']}")
-    print(f"  未找到/拒识:        {stats['target_not_found']}")
+    print(f"  总样本:              {len(results)}")
 
-    transcribed = [r for r in results if r["hyp"] not in (
-        "[NO_SEGMENTS]", "[NO_TARGET_SPEAKER]", "[NON_TARGET_SPEAKER]", "[ERROR]"
-    )]
-    if transcribed:
+    pass_results = [r for r in results if r.get("spk_pass")]
+    reject_results = [r for r in results if not r.get("spk_pass")]
+    multi_spk = [r for r in results if r.get("num_speakers", 0) > 1]
+
+    print(f"  声纹通过:            {len(pass_results)} ({100 * len(pass_results) / len(results):.1f}%)")
+    print(f"  声纹拒绝:            {len(reject_results)} ({100 * len(reject_results) / len(results):.1f}%)")
+    print(f"  检测到多人对话:      {len(multi_spk)} ({100 * len(multi_spk) / len(results):.1f}%)")
+
+    if pass_results:
+        transcribed = [r for r in pass_results if r["hyp"] not in ("[ERROR]", "[NO_SEGMENTS]")]
         cers = [r["cer"] for r in transcribed]
         avg_cer = sum(cers) / len(cers)
         perfect = sum(1 for c in cers if c == 0)
         bad = sum(1 for c in cers if c > 1.0)
-        print(f"\n  转录样本 CER (n={len(transcribed)}):")
+        print(f"\n  通过样本 CER (n={len(transcribed)}):")
         print(f"    平均 CER:        {avg_cer * 100:.2f}%")
         print(f"    完美 (0%):       {perfect} ({100 * perfect / len(cers):.1f}%)")
         print(f"    严重错误(>100%): {bad} ({100 * bad / len(cers):.1f}%)")
 
-    # By method
-    diar_results = [r for r in results if r.get("method") == "diarization"]
-    wf_results = [r for r in results if r.get("method") == "whole_file"]
-    for label, res in [("Diarization", diar_results), ("Whole-file", wf_results)]:
-        if res:
-            valid = [r for r in res if r["hyp"] not in (
-                "[NO_SEGMENTS]", "[NO_TARGET_SPEAKER]", "[NON_TARGET_SPEAKER]", "[ERROR]"
-            )]
+        # 多人 vs 单人
+        single_pass = [r for r in pass_results if r.get("num_speakers", 0) <= 1]
+        multi_pass = [r for r in pass_results if r.get("num_speakers", 0) > 1]
+        for label, group in [("单人", single_pass), ("多人", multi_pass)]:
+            valid = [r for r in group if r["hyp"] not in ("[ERROR]", "[NO_SEGMENTS]")]
             if valid:
-                print(f"\n  {label}: {len(valid)} transcribed, "
-                      f"CER={sum(r['cer'] for r in valid) / len(valid) * 100:.1f}%")
+                print(f"    {label}: {len(valid)} 条, CER={sum(r['cer'] for r in valid) / len(valid) * 100:.1f}%")
 
-    # Save
+    # 多人样本详情
+    if multi_spk:
+        print(f"\n  多人样本详情 (前 10):")
+        for r in multi_spk[:10]:
+            print(f"    [{r['id']}] {r['num_speakers']} speakers, target=spk_{r['target_spk']}, "
+                  f"sim={r.get('target_sim', 0):.3f}, CER={r['cer'] * 100:.1f}%")
+
     output = BASE_DIR / "pos_diarization_result.jsonl"
     with open(output, "w", encoding="utf-8") as f:
         for r in results:
