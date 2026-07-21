@@ -1,6 +1,7 @@
 # 模型文件 (太大)
 Qwen3-ASR-1.7B/
 models/
+checkpoints/
 
 # 临时文件
 tmp/
